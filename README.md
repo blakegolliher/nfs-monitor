@@ -24,24 +24,35 @@ nfs-monitor -a -d 60
 # You can also specify by device name
 nfs-monitor --mp=server:/export -d 120
 
+# Save report to a file (for later comparison)
+nfs-monitor -a -d 180 -o baseline.out
+
 # List available NFS mounts and exit
 nfs-monitor --list
 ```
 
 ### Compare two runs
 
-Capture output from two monitoring sessions, then compare:
+Capture output from two monitoring sessions using `-o`, then compare:
 
 ```bash
-nfs-monitor -a -d 180 > baseline.out
+nfs-monitor -a -d 180 -o baseline.out
 # ... change something ...
-nfs-monitor -a -d 180 > test.out
+nfs-monitor -a -d 180 -o test.out
 
 nfs-monitor compare baseline.out test.out
 nfs-monitor compare baseline.out test.out Baseline Test
 ```
 
+The `-o` flag writes the report to a file while progress and warnings still print to the terminal. You can also use shell redirection (`> baseline.out`) if you prefer.
+
 The comparison report shows ops/sec, latency, and per-operation breakdowns with ratios indicating which run performed better.
+
+Example output files are included in `examples/` so you can try the compare feature without live NFS mounts:
+
+```bash
+nfs-monitor compare examples/baseline.out examples/test.out Baseline Test
+```
 
 ## Flags
 
@@ -51,6 +62,7 @@ The comparison report shows ops/sec, latency, and per-operation breakdowns with 
 | `-a` | `--all` | `false` | Monitor all NFS mounts. |
 | `-d` | `--duration` | `60` | Monitoring duration in seconds. |
 | `-i` | `--interval` | `1` | Sample interval in seconds. |
+| `-o` | `--output` | | Write report to file (for later use with compare). |
 | | `--list` | `false` | List available NFS mounts and exit. |
 
 ### Compare subcommand

@@ -1,0 +1,45 @@
+
+===========================================================================
+NFS Mount Statistics Monitor
+===========================================================================
+Timestamp : 2026-03-25 10:00:00
+Hostname  : lab-node01
+
+Monitoring mounts:
+  server01:/export/data on /mnt/nfs1 (nfs, vers=4.1, proto=tcp)
+
+Starting 180s monitoring (interval: 1s)...
+Run your workload now.
+----------------------------------------
+
+===========================================================================
+NFS MONITORING RESULTS
+Duration: 180s | Samples: 180 | Interval: 1s
+===========================================================================
+
+───────────────────────────────────────────────────────────────────────────
+MOUNT: server01:/export/data (on /mnt/nfs1)
+───────────────────────────────────────────────────────────────────────────
+
+SUMMARY:
+  Total operations:       45,230  (251.3 ops/sec)
+  Retransmissions:            12  (0.03% of ops)
+  Timeouts:                    0
+  Errors:                      0
+
+LATENCY (ms):
+  Operation         Ops    Ops/s   RTT avg   RTT min   RTT max
+  ------------ ---------- -------- --------- --------- ---------
+  READ              28,410    157.8      1.25      0.40      8.50
+  WRITE              8,120     45.1      2.80      1.10     15.30
+  GETATTR            5,640     31.3      0.45      0.15      3.20
+  ACCESS             1,820     10.1      0.38      0.12      2.10
+  LOOKUP               940      5.2      0.52      0.18      4.80
+  OPEN                 180      1.0      1.10      0.50      5.20
+  CLOSE                120      0.7      0.85      0.30      3.50
+
+RETRANSMISSIONS BY OPERATION:
+  Operation        Count     % of ops
+  ------------ ---------- ----------
+  WRITE                 8       0.10%
+  READ                  4       0.01%

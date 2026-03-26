@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -98,6 +99,7 @@ func main() {
 		duration    int
 		interval    int
 		listMounts  bool
+		outputFile  string
 	)
 
 	flag.Var(&mountpoints, "mp", "NFS mountpoint to monitor (can specify multiple)")
@@ -108,6 +110,8 @@ func main() {
 	flag.IntVar(&interval, "i", 1, "Sample interval in seconds")
 	flag.IntVar(&interval, "interval", 1, "Sample interval in seconds")
 	flag.BoolVar(&listMounts, "list", false, "List available NFS mounts and exit")
+	flag.StringVar(&outputFile, "o", "", "Write report to file (for later use with compare)")
+	flag.StringVar(&outputFile, "output", "", "Write report to file (for later use with compare)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "NFS Mount Statistics Monitor\n\n")
@@ -122,6 +126,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -a, --all             Monitor all NFS mounts\n")
 		fmt.Fprintf(os.Stderr, "  -d, --duration=SECS   Monitoring duration in seconds (default 60)\n")
 		fmt.Fprintf(os.Stderr, "  -i, --interval=SECS   Sample interval in seconds (default 1)\n")
+		fmt.Fprintf(os.Stderr, "  -o, --output=FILE     Write report to file (for later use with compare)\n")
 		fmt.Fprintf(os.Stderr, "  --list                List available NFS mounts and exit\n")
 		fmt.Fprintf(os.Stderr, "\nSubcommands:\n")
 		fmt.Fprintf(os.Stderr, "  compare               Compare two nfs-monitor output files\n")
@@ -204,16 +209,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	printHeader()
-	printMountInfo(mounts)
+	// Set up report output destination.
+	var out io.Writer = os.Stdout
+	if outputFile != "" {
+		f, err := os.Create(outputFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating output file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		out = f
+	}
 
-	fmt.Printf("\nStarting %ds monitoring (interval: %ds)...\n", duration, interval)
-	fmt.Println("Run your workload now.")
-	fmt.Println(strings.Repeat("-", 40))
+	printHeader(out)
+	printMountInfo(out, mounts)
+
+	fmt.Fprintf(os.Stderr, "\nStarting %ds monitoring (interval: %ds)...\n", duration, interval)
+	fmt.Fprintln(os.Stderr, "Run your workload now.")
+	fmt.Fprintln(os.Stderr, strings.Repeat("-", 40))
 
 	samples := collectSamples(duration, interval, mounts)
 	if len(samples) == 0 {
-		fmt.Println("No samples collected.")
+		fmt.Fprintln(os.Stderr, "No samples collected.")
 		os.Exit(1)
 	}
 
@@ -228,7 +245,11 @@ func main() {
 		targetDevices[device] = mp
 	}
 
-	printReport(aggregated, duration, len(samples), interval, targetDevices)
+	printReport(out, aggregated, duration, len(samples), interval, targetDevices)
+
+	if outputFile != "" {
+		fmt.Fprintf(os.Stderr, "Report written to %s\n", outputFile)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +371,7 @@ func collectSamples(durationSec, intervalSec int, targetMounts map[string]*Mount
 				continue
 			}
 			if targetDevices[device] != info.MountPoint {
-				fmt.Printf("\nWarning: Mountpoint for device %s changed from %s to %s\n",
+				fmt.Fprintf(os.Stderr, "\nWarning: Mountpoint for device %s changed from %s to %s\n",
 					device, targetDevices[device], info.MountPoint)
 				targetDevices[device] = info.MountPoint
 				delete(prev, device)
@@ -367,7 +388,7 @@ func collectSamples(durationSec, intervalSec int, targetMounts map[string]*Mount
 			}
 			currInfo, ok := curr[device]
 			if !ok {
-				fmt.Printf("\nWarning: Device %s (at %s) is no longer mounted.\n", device, mountpoint)
+				fmt.Fprintf(os.Stderr, "\nWarning: Device %s (at %s) is no longer mounted.\n", device, mountpoint)
 				delete(prev, device)
 				continue
 			}
@@ -385,7 +406,7 @@ func collectSamples(durationSec, intervalSec int, targetMounts map[string]*Mount
 				delta, isReset := computeDelta(prevOp, currOp)
 				if isReset {
 					resetCount++
-					fmt.Printf("\nWarning: Counter reset detected for op '%s' on mount '%s'. Skipping sample.\n", opName, mountpoint)
+					fmt.Fprintf(os.Stderr, "\nWarning: Counter reset detected for op '%s' on mount '%s'. Skipping sample.\n", opName, mountpoint)
 					delete(prev, device)
 					break
 				}
@@ -409,13 +430,13 @@ func collectSamples(durationSec, intervalSec int, targetMounts map[string]*Mount
 
 		sampleNum++
 		elapsed := int(time.Since(startTime).Seconds())
-		fmt.Printf("\r  Sampling... %3ds / %ds  (%d samples)", elapsed, durationSec, sampleNum)
+		fmt.Fprintf(os.Stderr, "\r  Sampling... %3ds / %ds  (%d samples)", elapsed, durationSec, sampleNum)
 	}
 
-	fmt.Println()
+	fmt.Fprintln(os.Stderr)
 
 	if resetCount > 0 {
-		fmt.Printf("  Note: %d counter resets detected (likely due to remount or stats reset).\n", resetCount)
+		fmt.Fprintf(os.Stderr, "  Note: %d counter resets detected (likely due to remount or stats reset).\n", resetCount)
 	}
 
 	return samples
@@ -513,22 +534,22 @@ func aggregateSamples(samples []map[string]map[string]*OpDelta) map[string]map[s
 // Report output
 // ---------------------------------------------------------------------------
 
-func printHeader() {
-	fmt.Println(strings.Repeat("=", 75))
-	fmt.Println("NFS Mount Statistics Monitor")
-	fmt.Println(strings.Repeat("=", 75))
+func printHeader(w io.Writer) {
+	fmt.Fprintln(w, strings.Repeat("=", 75))
+	fmt.Fprintln(w, "NFS Mount Statistics Monitor")
+	fmt.Fprintln(w, strings.Repeat("=", 75))
 }
 
-func printMountInfo(mounts map[string]*MountInfo) {
-	fmt.Println("\nNFS Mounts to Monitor:")
-	fmt.Println(strings.Repeat("-", 70))
+func printMountInfo(w io.Writer, mounts map[string]*MountInfo) {
+	fmt.Fprintln(w, "\nNFS Mounts to Monitor:")
+	fmt.Fprintln(w, strings.Repeat("-", 70))
 
 	for device, info := range mounts {
-		fmt.Printf("\n  %s (on %s)\n", device, info.MountPoint)
-		fmt.Printf("    Type:   %s\n", info.FSType)
+		fmt.Fprintf(w, "\n  %s (on %s)\n", device, info.MountPoint)
+		fmt.Fprintf(w, "    Type:   %s\n", info.FSType)
 
 		if info.Options != "" {
-			fmt.Println("    Options:")
+			fmt.Fprintln(w, "    Options:")
 			opts := strings.Split(info.Options, ",")
 			line := "      "
 			isSoft := false
@@ -538,37 +559,37 @@ func printMountInfo(mounts map[string]*MountInfo) {
 					isSoft = true
 				}
 				if len(line)+len(opt)+2 > 75 {
-					fmt.Println(line)
+					fmt.Fprintln(w, line)
 					line = "      "
 				}
 				line += opt + ", "
 			}
 			if strings.TrimSpace(line) != "" {
-				fmt.Println(strings.TrimSuffix(line, ", "))
+				fmt.Fprintln(w, strings.TrimSuffix(line, ", "))
 			}
 			if isSoft {
-				fmt.Println("    ** WARNING: soft mount - errors returned to apps on timeout **")
+				fmt.Fprintln(w, "    ** WARNING: soft mount - errors returned to apps on timeout **")
 			}
 		}
 	}
 }
 
-func printReport(agg map[string]map[string]*AggregatedOp, durationSec, numSamples, intervalSec int, targetDevices map[string]string) {
-	fmt.Println()
-	fmt.Println(strings.Repeat("=", 75))
-	fmt.Println("NFS MONITORING RESULTS")
-	fmt.Printf("Duration: %ds | Samples: %d | Interval: %ds\n", durationSec, numSamples, intervalSec)
-	fmt.Println(strings.Repeat("=", 75))
+func printReport(w io.Writer, agg map[string]map[string]*AggregatedOp, durationSec, numSamples, intervalSec int, targetDevices map[string]string) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("=", 75))
+	fmt.Fprintln(w, "NFS MONITORING RESULTS")
+	fmt.Fprintf(w, "Duration: %ds | Samples: %d | Interval: %ds\n", durationSec, numSamples, intervalSec)
+	fmt.Fprintln(w, strings.Repeat("=", 75))
 
 	for device, opsData := range agg {
 		mountpoint := targetDevices[device]
 		if mountpoint == "" {
 			mountpoint = "N/A"
 		}
-		fmt.Println()
-		fmt.Println(strings.Repeat("─", 75))
-		fmt.Printf("MOUNT: %s (on %s)\n", device, mountpoint)
-		fmt.Println(strings.Repeat("─", 75))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, strings.Repeat("─", 75))
+		fmt.Fprintf(w, "MOUNT: %s (on %s)\n", device, mountpoint)
+		fmt.Fprintln(w, strings.Repeat("─", 75))
 
 		var totalOps, totalRetrans, totalTimeouts, totalErrors int64
 		for _, op := range opsData {
@@ -580,16 +601,16 @@ func printReport(agg map[string]map[string]*AggregatedOp, durationSec, numSample
 
 		opsPerSec := float64(totalOps) / float64(durationSec)
 
-		fmt.Println("\nSUMMARY:")
-		fmt.Printf("  Total operations: %12s  (%.1f ops/sec)\n", formatInt(totalOps), opsPerSec)
-		fmt.Printf("  Retransmissions:  %12s", formatInt(totalRetrans))
+		fmt.Fprintln(w, "\nSUMMARY:")
+		fmt.Fprintf(w, "  Total operations: %12s  (%.1f ops/sec)\n", formatInt(totalOps), opsPerSec)
+		fmt.Fprintf(w, "  Retransmissions:  %12s", formatInt(totalRetrans))
 		if totalRetrans > 0 && totalOps > 0 {
 			pct := float64(totalRetrans) / float64(totalOps) * 100
-			fmt.Printf("  (%.2f%% of ops)", pct)
+			fmt.Fprintf(w, "  (%.2f%% of ops)", pct)
 		}
-		fmt.Println()
-		fmt.Printf("  Timeouts:         %12s\n", formatInt(totalTimeouts))
-		fmt.Printf("  Errors:           %12s\n", formatInt(totalErrors))
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "  Timeouts:         %12s\n", formatInt(totalTimeouts))
+		fmt.Fprintf(w, "  Errors:           %12s\n", formatInt(totalErrors))
 
 		// Filter to active ops and sort by count descending.
 		var sortedOps []opEntry
@@ -600,7 +621,7 @@ func printReport(agg map[string]map[string]*AggregatedOp, durationSec, numSample
 		}
 
 		if len(sortedOps) == 0 {
-			fmt.Println("\n  No operations during sample period.")
+			fmt.Fprintln(w, "\n  No operations during sample period.")
 			continue
 		}
 
@@ -609,9 +630,9 @@ func printReport(agg map[string]map[string]*AggregatedOp, durationSec, numSample
 		})
 
 		// Latency table
-		fmt.Println("\nLATENCY (ms):")
-		fmt.Printf("  %-12s %10s %8s %9s %9s %9s\n", "Operation", "Ops", "Ops/s", "RTT avg", "RTT min", "RTT max")
-		fmt.Printf("  %s %s %s %s %s %s\n",
+		fmt.Fprintln(w, "\nLATENCY (ms):")
+		fmt.Fprintf(w, "  %-12s %10s %8s %9s %9s %9s\n", "Operation", "Ops", "Ops/s", "RTT avg", "RTT min", "RTT max")
+		fmt.Fprintf(w, "  %s %s %s %s %s %s\n",
 			strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 8),
 			strings.Repeat("-", 9), strings.Repeat("-", 9), strings.Repeat("-", 9))
 
@@ -638,21 +659,21 @@ func printReport(agg map[string]map[string]*AggregatedOp, durationSec, numSample
 				}
 			}
 
-			fmt.Printf("  %-12s %10s %8.1f %9.2f %9.2f %9.2f\n",
+			fmt.Fprintf(w, "  %-12s %10s %8.1f %9.2f %9.2f %9.2f\n",
 				entry.name, formatInt(ops), opsSec, avgRtt, minRtt, maxRtt)
 		}
 
 		// Breakdown tables
-		printBreakdownTable("RETRANSMISSIONS BY OPERATION",
+		printBreakdownTable(w, "RETRANSMISSIONS BY OPERATION",
 			filterOps(sortedOps, func(a *AggregatedOp) int64 { return a.RetransTotal }), true)
-		printBreakdownTable("TIMEOUTS BY OPERATION",
+		printBreakdownTable(w, "TIMEOUTS BY OPERATION",
 			filterOps(sortedOps, func(a *AggregatedOp) int64 { return a.TimeoutsTotal }), false)
-		printBreakdownTable("ERRORS BY OPERATION",
+		printBreakdownTable(w, "ERRORS BY OPERATION",
 			filterOps(sortedOps, func(a *AggregatedOp) int64 { return a.ErrorsTotal }), false)
 	}
 
-	fmt.Println()
-	fmt.Println(strings.Repeat("=", 75))
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("=", 75))
 }
 
 func filterOps(sorted []opEntry, accessor func(*AggregatedOp) int64) []breakdownEntry {
@@ -666,23 +687,23 @@ func filterOps(sorted []opEntry, accessor func(*AggregatedOp) int64) []breakdown
 	return entries
 }
 
-func printBreakdownTable(title string, entries []breakdownEntry, showPct bool) {
+func printBreakdownTable(w io.Writer, title string, entries []breakdownEntry, showPct bool) {
 	if len(entries) == 0 {
 		return
 	}
-	fmt.Printf("\n%s:\n", title)
+	fmt.Fprintf(w, "\n%s:\n", title)
 	if showPct {
-		fmt.Printf("  %-12s %10s %10s\n", "Operation", "Count", "% of ops")
-		fmt.Printf("  %s %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 10))
+		fmt.Fprintf(w, "  %-12s %10s %10s\n", "Operation", "Count", "% of ops")
+		fmt.Fprintf(w, "  %s %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 10))
 		for _, e := range entries {
 			pct := float64(e.count) / float64(e.ops) * 100
-			fmt.Printf("  %-12s %10s %9.2f%%\n", e.name, formatInt(e.count), pct)
+			fmt.Fprintf(w, "  %-12s %10s %9.2f%%\n", e.name, formatInt(e.count), pct)
 		}
 	} else {
-		fmt.Printf("  %-12s %10s\n", "Operation", "Count")
-		fmt.Printf("  %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10))
+		fmt.Fprintf(w, "  %-12s %10s\n", "Operation", "Count")
+		fmt.Fprintf(w, "  %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10))
 		for _, e := range entries {
-			fmt.Printf("  %-12s %10s\n", e.name, formatInt(e.count))
+			fmt.Fprintf(w, "  %-12s %10s\n", e.name, formatInt(e.count))
 		}
 	}
 }

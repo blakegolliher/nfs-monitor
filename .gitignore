@@ -3,3 +3,4 @@ nfs-monitor
 
 # Test output files
 *.out
+!examples/*.out
