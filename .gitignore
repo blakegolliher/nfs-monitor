@@ -1,0 +1,5 @@
+# Compiled binary
+nfs-monitor
+
+# Test output files
+*.out
