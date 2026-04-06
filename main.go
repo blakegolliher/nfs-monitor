@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -12,6 +14,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ---------------------------------------------------------------------------
+// Mountstats types
+// ---------------------------------------------------------------------------
 
 // OpStats holds per-operation statistics from mountstats.
 type OpStats struct {
@@ -45,7 +51,7 @@ type OpDelta struct {
 	ExecMs   int64
 }
 
-// AggregatedOp holds aggregated statistics for an operation.
+// AggregatedOp holds aggregated statistics for an operation across samples.
 type AggregatedOp struct {
 	OpsTotal       int64
 	RetransTotal   int64
@@ -53,41 +59,79 @@ type AggregatedOp struct {
 	ErrorsTotal    int64
 	RttWeightedMs  int64
 	ExecWeightedMs int64
-	RttSamples     []float64
+	RttMinMs       float64
+	RttMaxMs       float64
+	seenRtt        bool
 }
 
-// opEntry pairs an operation name with its aggregated data for sorting.
-type opEntry struct {
-	name string
-	data *AggregatedOp
+// ---------------------------------------------------------------------------
+// Report types (serialized to JSON for -o and consumed by compare)
+// ---------------------------------------------------------------------------
+
+const reportSchemaVersion = 1
+
+// Report is the top-level structured output of a monitoring run.
+type Report struct {
+	SchemaVersion int           `json:"schema_version"`
+	GeneratedAt   time.Time     `json:"generated_at"`
+	DurationSec   int           `json:"duration_sec"`
+	IntervalSec   int           `json:"interval_sec"`
+	Samples       int           `json:"samples"`
+	Mounts        []MountReport `json:"mounts"`
 }
 
-// breakdownEntry holds a single row for the breakdown tables.
-type breakdownEntry struct {
-	name  string
-	count int64
-	ops   int64
+// MountReport is the per-mount section of a Report.
+type MountReport struct {
+	Device     string       `json:"device"`
+	MountPoint string       `json:"mountpoint"`
+	FSType     string       `json:"fstype"`
+	Options    string       `json:"options"`
+	Summary    SummaryStats `json:"summary"`
+	Operations []OpReport   `json:"operations"`
 }
 
-// Package-level compiled regexes for mountstats parsing.
+// SummaryStats holds mount-level totals.
+type SummaryStats struct {
+	TotalOps  int64   `json:"total_ops"`
+	OpsPerSec float64 `json:"ops_per_sec"`
+	Retrans   int64   `json:"retransmissions"`
+	Timeouts  int64   `json:"timeouts"`
+	Errors    int64   `json:"errors"`
+}
+
+// OpReport holds per-operation aggregated stats, ordered by Ops descending.
+type OpReport struct {
+	Name      string  `json:"name"`
+	Ops       int64   `json:"ops"`
+	OpsPerSec float64 `json:"ops_per_sec"`
+	Retrans   int64   `json:"retransmissions"`
+	Timeouts  int64   `json:"timeouts"`
+	Errors    int64   `json:"errors"`
+	RttAvgMs  float64 `json:"rtt_avg_ms"`
+	RttMinMs  float64 `json:"rtt_min_ms"`
+	RttMaxMs  float64 `json:"rtt_max_ms"`
+}
+
+// ---------------------------------------------------------------------------
+// mountstats parsing
+// ---------------------------------------------------------------------------
+
 var (
 	deviceRe = regexp.MustCompile(`^device\s+(\S+)\s+mounted on\s+(\S+)\s+with fstype\s+(\S+)`)
 	opRe     = regexp.MustCompile(`^\s*(\w+):\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*(\d+)?`)
 )
 
+// stringSlice is a flag type that collects repeated values.
 type stringSlice []string
 
-func (s *stringSlice) String() string {
-	return strings.Join(*s, ", ")
-}
+func (s *stringSlice) String() string     { return strings.Join(*s, ", ") }
+func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
-func (s *stringSlice) Set(value string) error {
-	*s = append(*s, value)
-	return nil
-}
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 func main() {
-	// Dispatch to compare subcommand if requested.
 	if len(os.Args) > 1 && os.Args[1] == "compare" {
 		runCompare(os.Args[2:])
 		return
@@ -110,8 +154,8 @@ func main() {
 	flag.IntVar(&interval, "i", 1, "Sample interval in seconds")
 	flag.IntVar(&interval, "interval", 1, "Sample interval in seconds")
 	flag.BoolVar(&listMounts, "list", false, "List available NFS mounts and exit")
-	flag.StringVar(&outputFile, "o", "", "Write report to file (for later use with compare)")
-	flag.StringVar(&outputFile, "output", "", "Write report to file (for later use with compare)")
+	flag.StringVar(&outputFile, "o", "", "Write JSON report to file (for later use with compare)")
+	flag.StringVar(&outputFile, "output", "", "Write JSON report to file (for later use with compare)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "NFS Mount Statistics Monitor\n\n")
@@ -126,10 +170,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -a, --all             Monitor all NFS mounts\n")
 		fmt.Fprintf(os.Stderr, "  -d, --duration=SECS   Monitoring duration in seconds (default 60)\n")
 		fmt.Fprintf(os.Stderr, "  -i, --interval=SECS   Sample interval in seconds (default 1)\n")
-		fmt.Fprintf(os.Stderr, "  -o, --output=FILE     Write report to file (for later use with compare)\n")
+		fmt.Fprintf(os.Stderr, "  -o, --output=FILE     Write JSON report to file (for later use with compare)\n")
 		fmt.Fprintf(os.Stderr, "  --list                List available NFS mounts and exit\n")
 		fmt.Fprintf(os.Stderr, "\nSubcommands:\n")
-		fmt.Fprintf(os.Stderr, "  compare               Compare two nfs-monitor output files\n")
+		fmt.Fprintf(os.Stderr, "  compare               Compare two nfs-monitor JSON reports\n")
 	}
 
 	flag.Parse()
@@ -163,8 +207,8 @@ func main() {
 
 	if listMounts {
 		fmt.Println("Available NFS mounts (device and mountpoint):")
-		for device, info := range allMountStats {
-			fmt.Printf("  %s (on %s)\n", device, info.MountPoint)
+		for _, device := range sortedKeys(allMountStats) {
+			fmt.Printf("  %s (on %s)\n", device, allMountStats[device].MountPoint)
 		}
 		os.Exit(0)
 	}
@@ -176,17 +220,16 @@ func main() {
 		mounts = make(map[string]*MountInfo)
 		var missing []string
 		for _, target := range mountpoints {
-			found := false
 			if info, ok := allMountStats[target]; ok {
 				mounts[target] = info
-				found = true
-			} else {
-				for device, info := range allMountStats {
-					if info.MountPoint == target {
-						mounts[device] = info
-						found = true
-						break
-					}
+				continue
+			}
+			found := false
+			for device, info := range allMountStats {
+				if info.MountPoint == target {
+					mounts[device] = info
+					found = true
+					break
 				}
 			}
 			if !found {
@@ -197,8 +240,8 @@ func main() {
 		if len(missing) > 0 {
 			fmt.Fprintf(os.Stderr, "Error: Device(s) or Mountpoint(s) not found: %s\n", strings.Join(missing, ", "))
 			fmt.Fprintln(os.Stderr, "\nAvailable NFS devices and their mountpoints:")
-			for device, info := range allMountStats {
-				fmt.Fprintf(os.Stderr, "  %s (on %s)\n", device, info.MountPoint)
+			for _, device := range sortedKeys(allMountStats) {
+				fmt.Fprintf(os.Stderr, "  %s (on %s)\n", device, allMountStats[device].MountPoint)
 			}
 			os.Exit(1)
 		}
@@ -209,8 +252,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set up report output destination.
-	var out io.Writer = os.Stdout
+	// Validate we can create the output file before spending the sample window on monitoring.
+	var outFile *os.File
 	if outputFile != "" {
 		f, err := os.Create(outputFile)
 		if err != nil {
@@ -218,11 +261,11 @@ func main() {
 			os.Exit(1)
 		}
 		defer f.Close()
-		out = f
+		outFile = f
 	}
 
-	printHeader(out)
-	printMountInfo(out, mounts)
+	printHeader(os.Stdout)
+	printMountInfo(os.Stdout, mounts)
 
 	fmt.Fprintf(os.Stderr, "\nStarting %ds monitoring (interval: %ds)...\n", duration, interval)
 	fmt.Fprintln(os.Stderr, "Run your workload now.")
@@ -235,20 +278,16 @@ func main() {
 	}
 
 	aggregated := aggregateSamples(samples)
+	report := buildReport(aggregated, mounts, duration, interval, len(samples))
 
-	targetDevices := make(map[string]string)
-	for device, info := range mounts {
-		mp := info.MountPoint
-		if mp == "" {
-			mp = "N/A"
+	writeTextReport(os.Stdout, report)
+
+	if outFile != nil {
+		if err := writeJSONReport(outFile, report); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing report: %v\n", err)
+			os.Exit(1)
 		}
-		targetDevices[device] = mp
-	}
-
-	printReport(out, aggregated, duration, len(samples), interval, targetDevices)
-
-	if outputFile != "" {
-		fmt.Fprintf(os.Stderr, "Report written to %s\n", outputFile)
+		fmt.Fprintf(os.Stderr, "JSON report written to %s\n", outputFile)
 	}
 }
 
@@ -507,11 +546,15 @@ func aggregateSamples(samples []map[string]map[string]*OpDelta) map[string]map[s
 			}
 
 			for opName, delta := range opsDeltas {
-				if agg[device][opName] == nil {
-					agg[device][opName] = &AggregatedOp{}
+				a := agg[device][opName]
+				if a == nil {
+					a = &AggregatedOp{
+						RttMinMs: math.Inf(1),
+						RttMaxMs: math.Inf(-1),
+					}
+					agg[device][opName] = a
 				}
 
-				a := agg[device][opName]
 				a.OpsTotal += delta.Ops
 				a.RetransTotal += delta.Retrans
 				a.TimeoutsTotal += delta.Timeouts
@@ -521,7 +564,13 @@ func aggregateSamples(samples []map[string]map[string]*OpDelta) map[string]map[s
 
 				if delta.Ops > 0 {
 					avgRtt := float64(delta.RttMs) / float64(delta.Ops)
-					a.RttSamples = append(a.RttSamples, avgRtt)
+					if avgRtt < a.RttMinMs {
+						a.RttMinMs = avgRtt
+					}
+					if avgRtt > a.RttMaxMs {
+						a.RttMaxMs = avgRtt
+					}
+					a.seenRtt = true
 				}
 			}
 		}
@@ -531,8 +580,121 @@ func aggregateSamples(samples []map[string]map[string]*OpDelta) map[string]map[s
 }
 
 // ---------------------------------------------------------------------------
-// Report output
+// Report construction (the canonical data shape; text + JSON both consume this)
 // ---------------------------------------------------------------------------
+
+func buildReport(agg map[string]map[string]*AggregatedOp, mounts map[string]*MountInfo, durationSec, intervalSec, numSamples int) *Report {
+	report := &Report{
+		SchemaVersion: reportSchemaVersion,
+		GeneratedAt:   time.Now().UTC(),
+		DurationSec:   durationSec,
+		IntervalSec:   intervalSec,
+		Samples:       numSamples,
+	}
+
+	// Union of devices from requested mounts and sample-visible devices,
+	// so unmounted-mid-run devices and silent mounts both appear.
+	seen := make(map[string]bool)
+	var devices []string
+	for device := range mounts {
+		if !seen[device] {
+			devices = append(devices, device)
+			seen[device] = true
+		}
+	}
+	for device := range agg {
+		if !seen[device] {
+			devices = append(devices, device)
+			seen[device] = true
+		}
+	}
+	sort.Strings(devices)
+
+	for _, device := range devices {
+		mr := MountReport{Device: device}
+		if info := mounts[device]; info != nil {
+			mr.MountPoint = info.MountPoint
+			mr.FSType = info.FSType
+			mr.Options = info.Options
+		}
+
+		opsData := agg[device]
+		var totalOps, totalRetrans, totalTimeouts, totalErrors int64
+		for _, op := range opsData {
+			totalOps += op.OpsTotal
+			totalRetrans += op.RetransTotal
+			totalTimeouts += op.TimeoutsTotal
+			totalErrors += op.ErrorsTotal
+		}
+
+		opsPerSec := 0.0
+		if durationSec > 0 {
+			opsPerSec = float64(totalOps) / float64(durationSec)
+		}
+		mr.Summary = SummaryStats{
+			TotalOps:  totalOps,
+			OpsPerSec: opsPerSec,
+			Retrans:   totalRetrans,
+			Timeouts:  totalTimeouts,
+			Errors:    totalErrors,
+		}
+
+		for name, op := range opsData {
+			if op.OpsTotal == 0 {
+				continue
+			}
+			avgRtt := float64(op.RttWeightedMs) / float64(op.OpsTotal)
+			minRtt, maxRtt := op.RttMinMs, op.RttMaxMs
+			if !op.seenRtt {
+				minRtt, maxRtt = 0, 0
+			}
+			perOpSec := 0.0
+			if durationSec > 0 {
+				perOpSec = float64(op.OpsTotal) / float64(durationSec)
+			}
+			mr.Operations = append(mr.Operations, OpReport{
+				Name:      name,
+				Ops:       op.OpsTotal,
+				OpsPerSec: perOpSec,
+				Retrans:   op.RetransTotal,
+				Timeouts:  op.TimeoutsTotal,
+				Errors:    op.ErrorsTotal,
+				RttAvgMs:  avgRtt,
+				RttMinMs:  minRtt,
+				RttMaxMs:  maxRtt,
+			})
+		}
+		sort.Slice(mr.Operations, func(i, j int) bool {
+			return mr.Operations[i].Ops > mr.Operations[j].Ops
+		})
+
+		report.Mounts = append(report.Mounts, mr)
+	}
+
+	return report
+}
+
+// ---------------------------------------------------------------------------
+// Report output: text and JSON
+// ---------------------------------------------------------------------------
+
+func writeJSONReport(w io.Writer, report *Report) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(report)
+}
+
+func loadReport(path string) (*Report, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var r Report
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &r, nil
+}
 
 func printHeader(w io.Writer) {
 	fmt.Fprintln(w, strings.Repeat("=", 75))
@@ -544,7 +706,8 @@ func printMountInfo(w io.Writer, mounts map[string]*MountInfo) {
 	fmt.Fprintln(w, "\nNFS Mounts to Monitor:")
 	fmt.Fprintln(w, strings.Repeat("-", 70))
 
-	for device, info := range mounts {
+	for _, device := range sortedKeys(mounts) {
+		info := mounts[device]
 		fmt.Fprintf(w, "\n  %s (on %s)\n", device, info.MountPoint)
 		fmt.Fprintf(w, "    Type:   %s\n", info.FSType)
 
@@ -574,137 +737,102 @@ func printMountInfo(w io.Writer, mounts map[string]*MountInfo) {
 	}
 }
 
-func printReport(w io.Writer, agg map[string]map[string]*AggregatedOp, durationSec, numSamples, intervalSec int, targetDevices map[string]string) {
+func writeTextReport(w io.Writer, report *Report) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, strings.Repeat("=", 75))
 	fmt.Fprintln(w, "NFS MONITORING RESULTS")
-	fmt.Fprintf(w, "Duration: %ds | Samples: %d | Interval: %ds\n", durationSec, numSamples, intervalSec)
+	fmt.Fprintf(w, "Duration: %ds | Samples: %d | Interval: %ds\n",
+		report.DurationSec, report.Samples, report.IntervalSec)
 	fmt.Fprintln(w, strings.Repeat("=", 75))
 
-	for device, opsData := range agg {
-		mountpoint := targetDevices[device]
-		if mountpoint == "" {
-			mountpoint = "N/A"
-		}
-		fmt.Fprintln(w)
-		fmt.Fprintln(w, strings.Repeat("─", 75))
-		fmt.Fprintf(w, "MOUNT: %s (on %s)\n", device, mountpoint)
-		fmt.Fprintln(w, strings.Repeat("─", 75))
-
-		var totalOps, totalRetrans, totalTimeouts, totalErrors int64
-		for _, op := range opsData {
-			totalOps += op.OpsTotal
-			totalRetrans += op.RetransTotal
-			totalTimeouts += op.TimeoutsTotal
-			totalErrors += op.ErrorsTotal
-		}
-
-		opsPerSec := float64(totalOps) / float64(durationSec)
-
-		fmt.Fprintln(w, "\nSUMMARY:")
-		fmt.Fprintf(w, "  Total operations: %12s  (%.1f ops/sec)\n", formatInt(totalOps), opsPerSec)
-		fmt.Fprintf(w, "  Retransmissions:  %12s", formatInt(totalRetrans))
-		if totalRetrans > 0 && totalOps > 0 {
-			pct := float64(totalRetrans) / float64(totalOps) * 100
-			fmt.Fprintf(w, "  (%.2f%% of ops)", pct)
-		}
-		fmt.Fprintln(w)
-		fmt.Fprintf(w, "  Timeouts:         %12s\n", formatInt(totalTimeouts))
-		fmt.Fprintf(w, "  Errors:           %12s\n", formatInt(totalErrors))
-
-		// Filter to active ops and sort by count descending.
-		var sortedOps []opEntry
-		for name, op := range opsData {
-			if op.OpsTotal > 0 {
-				sortedOps = append(sortedOps, opEntry{name, op})
-			}
-		}
-
-		if len(sortedOps) == 0 {
-			fmt.Fprintln(w, "\n  No operations during sample period.")
-			continue
-		}
-
-		sort.Slice(sortedOps, func(i, j int) bool {
-			return sortedOps[i].data.OpsTotal > sortedOps[j].data.OpsTotal
-		})
-
-		// Latency table
-		fmt.Fprintln(w, "\nLATENCY (ms):")
-		fmt.Fprintf(w, "  %-12s %10s %8s %9s %9s %9s\n", "Operation", "Ops", "Ops/s", "RTT avg", "RTT min", "RTT max")
-		fmt.Fprintf(w, "  %s %s %s %s %s %s\n",
-			strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 8),
-			strings.Repeat("-", 9), strings.Repeat("-", 9), strings.Repeat("-", 9))
-
-		for _, entry := range sortedOps {
-			ops := entry.data.OpsTotal
-			opsSec := float64(ops) / float64(durationSec)
-
-			var avgRtt float64
-			if ops > 0 {
-				avgRtt = float64(entry.data.RttWeightedMs) / float64(ops)
-			}
-
-			var minRtt, maxRtt float64
-			if len(entry.data.RttSamples) > 0 {
-				minRtt = entry.data.RttSamples[0]
-				maxRtt = entry.data.RttSamples[0]
-				for _, v := range entry.data.RttSamples {
-					if v < minRtt {
-						minRtt = v
-					}
-					if v > maxRtt {
-						maxRtt = v
-					}
-				}
-			}
-
-			fmt.Fprintf(w, "  %-12s %10s %8.1f %9.2f %9.2f %9.2f\n",
-				entry.name, formatInt(ops), opsSec, avgRtt, minRtt, maxRtt)
-		}
-
-		// Breakdown tables
-		printBreakdownTable(w, "RETRANSMISSIONS BY OPERATION",
-			filterOps(sortedOps, func(a *AggregatedOp) int64 { return a.RetransTotal }), true)
-		printBreakdownTable(w, "TIMEOUTS BY OPERATION",
-			filterOps(sortedOps, func(a *AggregatedOp) int64 { return a.TimeoutsTotal }), false)
-		printBreakdownTable(w, "ERRORS BY OPERATION",
-			filterOps(sortedOps, func(a *AggregatedOp) int64 { return a.ErrorsTotal }), false)
+	for i := range report.Mounts {
+		writeTextMountSection(w, &report.Mounts[i])
 	}
 
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, strings.Repeat("=", 75))
 }
 
-func filterOps(sorted []opEntry, accessor func(*AggregatedOp) int64) []breakdownEntry {
-	var entries []breakdownEntry
-	for _, e := range sorted {
-		count := accessor(e.data)
-		if count > 0 {
-			entries = append(entries, breakdownEntry{e.name, count, e.data.OpsTotal})
-		}
+func writeTextMountSection(w io.Writer, mr *MountReport) {
+	mountpoint := mr.MountPoint
+	if mountpoint == "" {
+		mountpoint = "N/A"
 	}
-	return entries
-}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("─", 75))
+	fmt.Fprintf(w, "MOUNT: %s (on %s)\n", mr.Device, mountpoint)
+	fmt.Fprintln(w, strings.Repeat("─", 75))
 
-func printBreakdownTable(w io.Writer, title string, entries []breakdownEntry, showPct bool) {
-	if len(entries) == 0 {
+	fmt.Fprintln(w, "\nSUMMARY:")
+	fmt.Fprintf(w, "  Total operations: %12s  (%.1f ops/sec)\n",
+		formatInt(mr.Summary.TotalOps), mr.Summary.OpsPerSec)
+	fmt.Fprintf(w, "  Retransmissions:  %12s", formatInt(mr.Summary.Retrans))
+	if mr.Summary.Retrans > 0 && mr.Summary.TotalOps > 0 {
+		pct := float64(mr.Summary.Retrans) / float64(mr.Summary.TotalOps) * 100
+		fmt.Fprintf(w, "  (%.2f%% of ops)", pct)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  Timeouts:         %12s\n", formatInt(mr.Summary.Timeouts))
+	fmt.Fprintf(w, "  Errors:           %12s\n", formatInt(mr.Summary.Errors))
+
+	if len(mr.Operations) == 0 {
+		fmt.Fprintln(w, "\n  No operations during sample period.")
 		return
 	}
+
+	fmt.Fprintln(w, "\nLATENCY (ms):")
+	fmt.Fprintf(w, "  %-12s %10s %8s %9s %9s %9s\n",
+		"Operation", "Ops", "Ops/s", "RTT avg", "RTT min", "RTT max")
+	fmt.Fprintf(w, "  %s %s %s %s %s %s\n",
+		strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 8),
+		strings.Repeat("-", 9), strings.Repeat("-", 9), strings.Repeat("-", 9))
+
+	for _, op := range mr.Operations {
+		fmt.Fprintf(w, "  %-12s %10s %8.1f %9.2f %9.2f %9.2f\n",
+			op.Name, formatInt(op.Ops), op.OpsPerSec,
+			op.RttAvgMs, op.RttMinMs, op.RttMaxMs)
+	}
+
+	writeBreakdownTable(w, "RETRANSMISSIONS BY OPERATION", mr.Operations,
+		func(o *OpReport) int64 { return o.Retrans }, true)
+	writeBreakdownTable(w, "TIMEOUTS BY OPERATION", mr.Operations,
+		func(o *OpReport) int64 { return o.Timeouts }, false)
+	writeBreakdownTable(w, "ERRORS BY OPERATION", mr.Operations,
+		func(o *OpReport) int64 { return o.Errors }, false)
+}
+
+func writeBreakdownTable(w io.Writer, title string, ops []OpReport, accessor func(*OpReport) int64, showPct bool) {
+	type row struct {
+		name  string
+		count int64
+		total int64
+	}
+	var rows []row
+	for i := range ops {
+		c := accessor(&ops[i])
+		if c > 0 {
+			rows = append(rows, row{ops[i].Name, c, ops[i].Ops})
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+
 	fmt.Fprintf(w, "\n%s:\n", title)
 	if showPct {
 		fmt.Fprintf(w, "  %-12s %10s %10s\n", "Operation", "Count", "% of ops")
-		fmt.Fprintf(w, "  %s %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 10))
-		for _, e := range entries {
-			pct := float64(e.count) / float64(e.ops) * 100
-			fmt.Fprintf(w, "  %-12s %10s %9.2f%%\n", e.name, formatInt(e.count), pct)
+		fmt.Fprintf(w, "  %s %s %s\n",
+			strings.Repeat("-", 12), strings.Repeat("-", 10), strings.Repeat("-", 10))
+		for _, r := range rows {
+			pct := float64(r.count) / float64(r.total) * 100
+			fmt.Fprintf(w, "  %-12s %10s %9.2f%%\n", r.name, formatInt(r.count), pct)
 		}
-	} else {
-		fmt.Fprintf(w, "  %-12s %10s\n", "Operation", "Count")
-		fmt.Fprintf(w, "  %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10))
-		for _, e := range entries {
-			fmt.Fprintf(w, "  %-12s %10s\n", e.name, formatInt(e.count))
-		}
+		return
+	}
+	fmt.Fprintf(w, "  %-12s %10s\n", "Operation", "Count")
+	fmt.Fprintf(w, "  %s %s\n", strings.Repeat("-", 12), strings.Repeat("-", 10))
+	for _, r := range rows {
+		fmt.Fprintf(w, "  %-12s %10s\n", r.name, formatInt(r.count))
 	}
 }
 
@@ -712,43 +840,10 @@ func printBreakdownTable(w io.Writer, title string, entries []breakdownEntry, sh
 // Compare subcommand
 // ---------------------------------------------------------------------------
 
-// compareMetrics holds parsed metrics from an nfs-monitor output file.
-type compareMetrics struct {
-	Mount      string
-	Duration   int
-	OpsSec     float64
-	TotalOps   int64
-	Retrans    int64
-	Timeouts   int64
-	Errors     int64
-	Operations map[string]*compareOpMetrics
-}
-
-// compareOpMetrics holds per-operation metrics parsed from output.
-type compareOpMetrics struct {
-	Ops    int64
-	OpsSec float64
-	RttAvg float64
-	RttMin float64
-	RttMax float64
-}
-
-// Compiled regexes for parsing nfs-monitor text output.
-var (
-	cmpMountRe     = regexp.MustCompile(`MOUNT:\s+(\S+)`)
-	cmpDurationRe  = regexp.MustCompile(`Duration:\s+(\d+)s`)
-	cmpOpsSecRe    = regexp.MustCompile(`\(([0-9.]+)\s+ops/sec\)`)
-	cmpTotalOpsRe  = regexp.MustCompile(`Total operations:\s+([0-9,]+)`)
-	cmpRetransRe   = regexp.MustCompile(`Retransmissions:\s+([0-9,]+)`)
-	cmpTimeoutsRe  = regexp.MustCompile(`Timeouts:\s+([0-9,]+)`)
-	cmpErrorsRe    = regexp.MustCompile(`(?m)^\s+Errors:\s+([0-9,]+)`)
-	cmpLatencyOpRe = regexp.MustCompile(`(?m)^\s+([A-Z]+)\s+([0-9,]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)`)
-)
-
 func runCompare(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: nfs-monitor compare <file1> <file2> [label1] [label2]\n")
-		fmt.Fprintf(os.Stderr, "Example: nfs-monitor compare vast-run.out hnas-run.out VAST HNAS\n")
+		fmt.Fprintln(os.Stderr, "Usage: nfs-monitor compare <file1> <file2> [label1] [label2]")
+		fmt.Fprintln(os.Stderr, "Example: nfs-monitor compare vast-run.json hnas-run.json VAST HNAS")
 		os.Exit(1)
 	}
 
@@ -761,72 +856,39 @@ func runCompare(args []string) {
 		label2 = args[3]
 	}
 
-	m1, err := parseNFSOutput(file1)
+	r1, err := loadReport(file1)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", file1, err)
 		os.Exit(1)
 	}
-	m2, err := parseNFSOutput(file2)
+	r2, err := loadReport(file2)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", file2, err)
 		os.Exit(1)
 	}
 
-	printComparison(m1, m2, label1, label2)
+	m1 := primaryMount(r1, file1)
+	m2 := primaryMount(r2, file2)
+
+	printComparison(os.Stdout, r1, r2, m1, m2, label1, label2)
 }
 
-func parseNFSOutput(filepath string) (*compareMetrics, error) {
-	data, err := os.ReadFile(filepath)
-	if err != nil {
-		return nil, err
+// primaryMount returns the first mount from a report, warning on stderr
+// if the report contains more than one. Exits if it is empty.
+func primaryMount(r *Report, path string) *MountReport {
+	if len(r.Mounts) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: %s contains no mounts\n", path)
+		os.Exit(1)
 	}
-	content := string(data)
-
-	m := &compareMetrics{
-		Operations: make(map[string]*compareOpMetrics),
+	if len(r.Mounts) > 1 {
+		fmt.Fprintf(os.Stderr, "Note: %s contains %d mounts; comparing the first (%s).\n",
+			path, len(r.Mounts), r.Mounts[0].Device)
 	}
-
-	if match := cmpMountRe.FindStringSubmatch(content); match != nil {
-		m.Mount = match[1]
-	}
-	if match := cmpDurationRe.FindStringSubmatch(content); match != nil {
-		m.Duration = int(parseInt(match[1]))
-	}
-	if match := cmpOpsSecRe.FindStringSubmatch(content); match != nil {
-		m.OpsSec, _ = strconv.ParseFloat(match[1], 64)
-	}
-	if match := cmpTotalOpsRe.FindStringSubmatch(content); match != nil {
-		m.TotalOps = parseFormattedInt(match[1])
-	}
-	if match := cmpRetransRe.FindStringSubmatch(content); match != nil {
-		m.Retrans = parseFormattedInt(match[1])
-	}
-	if match := cmpTimeoutsRe.FindStringSubmatch(content); match != nil {
-		m.Timeouts = parseFormattedInt(match[1])
-	}
-	if match := cmpErrorsRe.FindStringSubmatch(content); match != nil {
-		m.Errors = parseFormattedInt(match[1])
-	}
-
-	for _, match := range cmpLatencyOpRe.FindAllStringSubmatch(content, -1) {
-		opsSec, _ := strconv.ParseFloat(match[3], 64)
-		rttAvg, _ := strconv.ParseFloat(match[4], 64)
-		rttMin, _ := strconv.ParseFloat(match[5], 64)
-		rttMax, _ := strconv.ParseFloat(match[6], 64)
-		m.Operations[match[1]] = &compareOpMetrics{
-			Ops:    parseFormattedInt(match[2]),
-			OpsSec: opsSec,
-			RttAvg: rttAvg,
-			RttMin: rttMin,
-			RttMax: rttMax,
-		}
-	}
-
-	return m, nil
+	return &r.Mounts[0]
 }
 
-func printComparison(m1, m2 *compareMetrics, label1, label2 string) {
-	mount1, mount2 := m1.Mount, m2.Mount
+func printComparison(w io.Writer, r1, r2 *Report, m1, m2 *MountReport, label1, label2 string) {
+	mount1, mount2 := m1.Device, m2.Device
 	if mount1 == "" {
 		mount1 = "N/A"
 	}
@@ -834,146 +896,140 @@ func printComparison(m1, m2 *compareMetrics, label1, label2 string) {
 		mount2 = "N/A"
 	}
 
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Println("NFS Performance Comparison")
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Println()
-	fmt.Printf("%-20s %-25s %-25s\n", "", label1, label2)
-	fmt.Println(strings.Repeat("-", 80))
-	fmt.Printf("%-20s %-25s %-25s\n", "Mount:", mount1, mount2)
-	fmt.Printf("%-20s %-25s %-25s\n", "Duration:",
-		fmt.Sprintf("%ds", m1.Duration), fmt.Sprintf("%ds", m2.Duration))
-	fmt.Println()
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintln(w, "NFS Performance Comparison")
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%-20s %-25s %-25s\n", "", label1, label2)
+	fmt.Fprintln(w, strings.Repeat("-", 80))
+	fmt.Fprintf(w, "%-20s %-25s %-25s\n", "Mount:", mount1, mount2)
+	fmt.Fprintf(w, "%-20s %-25s %-25s\n", "Duration:",
+		fmt.Sprintf("%ds", r1.DurationSec), fmt.Sprintf("%ds", r2.DurationSec))
+	fmt.Fprintln(w)
 
 	// Summary
-	fmt.Println("SUMMARY")
-	fmt.Println(strings.Repeat("-", 80))
-	fmt.Printf("%-20s %12s %12s %12s %12s\n", "Metric", label1, label2, "Ratio", "Better")
-	fmt.Printf("%-20s %12s %12s %12s %12s\n", "", "", "", fmt.Sprintf("(%s/%s)", label2, label1), "")
-	fmt.Println(strings.Repeat("-", 80))
+	fmt.Fprintln(w, "SUMMARY")
+	fmt.Fprintln(w, strings.Repeat("-", 80))
+	fmt.Fprintf(w, "%-20s %12s %12s %12s %12s\n", "Metric", label1, label2, "Ratio", "Better")
+	fmt.Fprintf(w, "%-20s %12s %12s %12s %12s\n", "", "", "",
+		fmt.Sprintf("(%s/%s)", label2, label1), "")
+	fmt.Fprintln(w, strings.Repeat("-", 80))
 
-	if m1.OpsSec > 0 && m2.OpsSec > 0 {
-		ratio := m2.OpsSec / m1.OpsSec
-		better := "="
-		if ratio > 1 {
-			better = fmt.Sprintf("<- %s", label2)
-		} else if ratio < 1 {
-			better = fmt.Sprintf("%s ->", label1)
-		}
-		fmt.Printf("%-20s %12.1f %12.1f %12s %12s\n", "Ops/sec", m1.OpsSec, m2.OpsSec, formatRatio(ratio), better)
+	if m1.Summary.OpsPerSec > 0 && m2.Summary.OpsPerSec > 0 {
+		ratio := m2.Summary.OpsPerSec / m1.Summary.OpsPerSec
+		better := compareBetter(ratio, label1, label2, false)
+		fmt.Fprintf(w, "%-20s %12.1f %12.1f %12s %12s\n", "Ops/sec",
+			m1.Summary.OpsPerSec, m2.Summary.OpsPerSec, formatRatio(ratio), better)
+	}
+	fmt.Fprintf(w, "%-20s %12s %12s\n", "Total Ops", formatInt(m1.Summary.TotalOps), formatInt(m2.Summary.TotalOps))
+	fmt.Fprintf(w, "%-20s %12s %12s\n", "Retransmissions", formatInt(m1.Summary.Retrans), formatInt(m2.Summary.Retrans))
+	fmt.Fprintf(w, "%-20s %12s %12s\n", "Timeouts", formatInt(m1.Summary.Timeouts), formatInt(m2.Summary.Timeouts))
+	fmt.Fprintf(w, "%-20s %12s %12s\n", "Errors", formatInt(m1.Summary.Errors), formatInt(m2.Summary.Errors))
+	fmt.Fprintln(w)
+
+	ops1 := indexOps(m1.Operations)
+	ops2 := indexOps(m2.Operations)
+	orderedOps := unionOpsByTotal(m1.Operations, m2.Operations)
+
+	// Latency comparison (lower is better)
+	fmt.Fprintln(w, "LATENCY COMPARISON (RTT avg in ms) - lower is better")
+	fmt.Fprintln(w, strings.Repeat("-", 80))
+	fmt.Fprintf(w, "%-12s %10s %10s %12s %12s\n", "Operation", label1, label2, "Ratio", "Better")
+	fmt.Fprintf(w, "%-12s %10s %10s %12s %12s\n", "", "(ms)", "(ms)",
+		fmt.Sprintf("(%s/%s)", label2, label1), "")
+	fmt.Fprintln(w, strings.Repeat("-", 80))
+	for _, name := range orderedOps {
+		v1 := opField(ops1[name], func(o *OpReport) float64 { return o.RttAvgMs })
+		v2 := opField(ops2[name], func(o *OpReport) float64 { return o.RttAvgMs })
+		writeCompareRow(w, name, v1, v2, label1, label2, true, 2)
+	}
+	fmt.Fprintln(w)
+
+	// Ops/sec comparison (higher is better)
+	fmt.Fprintln(w, "OPS/SEC BY OPERATION - higher is better")
+	fmt.Fprintln(w, strings.Repeat("-", 80))
+	fmt.Fprintf(w, "%-12s %10s %10s %12s %12s\n", "Operation", label1, label2, "Ratio", "Better")
+	fmt.Fprintf(w, "%-12s %10s %10s %12s %12s\n", "", "(ops/s)", "(ops/s)",
+		fmt.Sprintf("(%s/%s)", label2, label1), "")
+	fmt.Fprintln(w, strings.Repeat("-", 80))
+	for _, name := range orderedOps {
+		v1 := opField(ops1[name], func(o *OpReport) float64 { return o.OpsPerSec })
+		v2 := opField(ops2[name], func(o *OpReport) float64 { return o.OpsPerSec })
+		writeCompareRow(w, name, v1, v2, label1, label2, false, 1)
 	}
 
-	fmt.Printf("%-20s %12s %12s\n", "Total Ops", formatInt(m1.TotalOps), formatInt(m2.TotalOps))
-	fmt.Printf("%-20s %12s %12s\n", "Retransmissions", formatInt(m1.Retrans), formatInt(m2.Retrans))
-	fmt.Printf("%-20s %12s %12s\n", "Timeouts", formatInt(m1.Timeouts), formatInt(m2.Timeouts))
-	fmt.Printf("%-20s %12s %12s\n", "Errors", formatInt(m1.Errors), formatInt(m2.Errors))
-	fmt.Println()
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+	fmt.Fprintf(w, "All ratios: (%s / %s)\n", label2, label1)
+	fmt.Fprintf(w, "  Latency:  < 1 means %s is faster, > 1 means %s is faster\n", label2, label1)
+	fmt.Fprintf(w, "  Ops/sec:  > 1 means %s is faster, < 1 means %s is faster\n", label2, label1)
+	fmt.Fprintln(w, strings.Repeat("=", 80))
+}
 
-	// Collect all operations sorted by total ops count across both files.
-	allOpsSet := make(map[string]bool)
-	for op := range m1.Operations {
-		allOpsSet[op] = true
+// indexOps returns a map of operation name -> pointer into the slice for O(1) lookup.
+func indexOps(ops []OpReport) map[string]*OpReport {
+	out := make(map[string]*OpReport, len(ops))
+	for i := range ops {
+		out[ops[i].Name] = &ops[i]
 	}
-	for op := range m2.Operations {
-		allOpsSet[op] = true
+	return out
+}
+
+// unionOpsByTotal returns operation names from both slices, sorted by combined ops desc.
+func unionOpsByTotal(a, b []OpReport) []string {
+	totals := make(map[string]int64)
+	for _, op := range a {
+		totals[op.Name] += op.Ops
 	}
-	var allOps []string
-	for op := range allOpsSet {
-		allOps = append(allOps, op)
+	for _, op := range b {
+		totals[op.Name] += op.Ops
 	}
-	sort.Slice(allOps, func(i, j int) bool {
-		ci := int64(0)
-		cj := int64(0)
-		if o, ok := m1.Operations[allOps[i]]; ok {
-			ci += o.Ops
-		}
-		if o, ok := m2.Operations[allOps[i]]; ok {
-			ci += o.Ops
-		}
-		if o, ok := m1.Operations[allOps[j]]; ok {
-			cj += o.Ops
-		}
-		if o, ok := m2.Operations[allOps[j]]; ok {
-			cj += o.Ops
-		}
-		return ci > cj
-	})
-
-	// Latency comparison
-	fmt.Println("LATENCY COMPARISON (RTT avg in ms) - lower is better")
-	fmt.Println(strings.Repeat("-", 80))
-	fmt.Printf("%-12s %10s %10s %12s %12s\n", "Operation", label1, label2, "Ratio", "Better")
-	fmt.Printf("%-12s %10s %10s %12s %12s\n", "", "(ms)", "(ms)", fmt.Sprintf("(%s/%s)", label2, label1), "")
-	fmt.Println(strings.Repeat("-", 80))
-
-	for _, op := range allOps {
-		op1 := m1.Operations[op]
-		op2 := m2.Operations[op]
-		rtt1, rtt2 := float64(0), float64(0)
-		if op1 != nil {
-			rtt1 = op1.RttAvg
-		}
-		if op2 != nil {
-			rtt2 = op2.RttAvg
-		}
-
-		if rtt1 > 0 && rtt2 > 0 {
-			ratio := rtt2 / rtt1
-			better := "="
-			if ratio < 1 {
-				better = fmt.Sprintf("<- %s", label2)
-			} else if ratio > 1 {
-				better = fmt.Sprintf("%s ->", label1)
-			}
-			fmt.Printf("%-12s %10.2f %10.2f %12s %12s\n", op, rtt1, rtt2, formatRatio(ratio), better)
-		} else if rtt1 > 0 {
-			fmt.Printf("%-12s %10.2f %10s %12s %12s\n", op, rtt1, "-", "-", "-")
-		} else if rtt2 > 0 {
-			fmt.Printf("%-12s %10s %10.2f %12s %12s\n", op, "-", rtt2, "-", "-")
-		}
+	names := make([]string, 0, len(totals))
+	for n := range totals {
+		names = append(names, n)
 	}
-	fmt.Println()
+	sort.Slice(names, func(i, j int) bool { return totals[names[i]] > totals[names[j]] })
+	return names
+}
 
-	// Ops/sec comparison
-	fmt.Println("OPS/SEC BY OPERATION - higher is better")
-	fmt.Println(strings.Repeat("-", 80))
-	fmt.Printf("%-12s %10s %10s %12s %12s\n", "Operation", label1, label2, "Ratio", "Better")
-	fmt.Printf("%-12s %10s %10s %12s %12s\n", "", "(ops/s)", "(ops/s)", fmt.Sprintf("(%s/%s)", label2, label1), "")
-	fmt.Println(strings.Repeat("-", 80))
-
-	for _, op := range allOps {
-		op1 := m1.Operations[op]
-		op2 := m2.Operations[op]
-		sec1, sec2 := float64(0), float64(0)
-		if op1 != nil {
-			sec1 = op1.OpsSec
-		}
-		if op2 != nil {
-			sec2 = op2.OpsSec
-		}
-
-		if sec1 > 0 && sec2 > 0 {
-			ratio := sec2 / sec1
-			better := "="
-			if ratio > 1 {
-				better = fmt.Sprintf("<- %s", label2)
-			} else if ratio < 1 {
-				better = fmt.Sprintf("%s ->", label1)
-			}
-			fmt.Printf("%-12s %10.1f %10.1f %12s %12s\n", op, sec1, sec2, formatRatio(ratio), better)
-		} else if sec1 > 0 {
-			fmt.Printf("%-12s %10.1f %10s %12s %12s\n", op, sec1, "-", "-", "-")
-		} else if sec2 > 0 {
-			fmt.Printf("%-12s %10s %10.1f %12s %12s\n", op, "-", sec2, "-", "-")
-		}
+// opField reads a field from an OpReport pointer, returning 0 if the pointer is nil.
+func opField(op *OpReport, fn func(*OpReport) float64) float64 {
+	if op == nil {
+		return 0
 	}
+	return fn(op)
+}
 
-	fmt.Println()
-	fmt.Println(strings.Repeat("=", 80))
-	fmt.Printf("All ratios: (%s / %s)\n", label2, label1)
-	fmt.Println("  Latency:  < 1 means", label2, "is faster, > 1 means", label1, "is faster")
-	fmt.Println("  Ops/sec:  > 1 means", label2, "is faster, < 1 means", label1, "is faster")
-	fmt.Println(strings.Repeat("=", 80))
+// compareBetter returns a short arrow label indicating which side wins.
+// For latency (lowerIsBetter=true), ratio < 1 means label2 wins.
+// For throughput (lowerIsBetter=false), ratio > 1 means label2 wins.
+func compareBetter(ratio float64, label1, label2 string, lowerIsBetter bool) string {
+	switch {
+	case ratio == 1:
+		return "="
+	case lowerIsBetter && ratio < 1, !lowerIsBetter && ratio > 1:
+		return fmt.Sprintf("<- %s", label2)
+	default:
+		return fmt.Sprintf("%s ->", label1)
+	}
+}
+
+// writeCompareRow prints one row of a comparison table, handling missing values
+// on either side by showing "-" in place of the value and ratio.
+func writeCompareRow(w io.Writer, name string, v1, v2 float64, label1, label2 string, lowerIsBetter bool, precision int) {
+	switch {
+	case v1 > 0 && v2 > 0:
+		ratio := v2 / v1
+		better := compareBetter(ratio, label1, label2, lowerIsBetter)
+		fmt.Fprintf(w, "%-12s %10.*f %10.*f %12s %12s\n",
+			name, precision, v1, precision, v2, formatRatio(ratio), better)
+	case v1 > 0:
+		fmt.Fprintf(w, "%-12s %10.*f %10s %12s %12s\n",
+			name, precision, v1, "-", "-", "-")
+	case v2 > 0:
+		fmt.Fprintf(w, "%-12s %10s %10.*f %12s %12s\n",
+			name, "-", precision, v2, "-", "-")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -983,10 +1039,6 @@ func printComparison(m1, m2 *compareMetrics, label1, label2 string) {
 func parseInt(s string) int64 {
 	v, _ := strconv.ParseInt(s, 10, 64)
 	return v
-}
-
-func parseFormattedInt(s string) int64 {
-	return parseInt(strings.ReplaceAll(s, ",", ""))
 }
 
 func formatInt(n int64) string {
@@ -1006,4 +1058,14 @@ func formatInt(n int64) string {
 
 func formatRatio(val float64) string {
 	return fmt.Sprintf("%.2fx", val)
+}
+
+// sortedKeys returns the keys of a map sorted alphabetically.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
