@@ -1,5 +1,18 @@
 # nfs-monitor
 
+> **Deprecated — see [nfs-gaze](https://github.com/blakegolliher/nfs-gaze).**
+>
+> nfs-monitor is no longer actively developed. Every feature in this
+> tool (live monitoring, operation filtering, JSON snapshots via
+> `-o`/`--output`, fixed-duration capture via `-d`/`--duration`, and
+> the `compare` subcommand) has been folded into **nfs-gaze**, which
+> is the successor. The JSON snapshot schema is preserved byte for
+> byte, so baseline reports written with `nfs-monitor -o` remain
+> readable by `nfs-gaze compare`.
+>
+> New captures, new features, and bug fixes should all happen in
+> nfs-gaze. This repository is retained for historical reference.
+
 A command-line tool for monitoring NFS mount performance in real-time on Linux. It reads kernel-level statistics from `/proc/self/mountstats`, samples at configurable intervals, and produces a detailed report covering latency, throughput, retransmissions, timeouts, and errors per NFS operation.
 
 Includes a built-in `compare` subcommand for side-by-side comparison of two monitoring runs.
